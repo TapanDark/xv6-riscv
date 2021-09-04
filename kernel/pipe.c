@@ -8,7 +8,7 @@
 #include "sleeplock.h"
 #include "file.h"
 
-#define PIPESIZE 512
+#define PIPESIZE 2048
 
 struct pipe {
   struct spinlock lock;
@@ -76,38 +76,52 @@ pipeclose(struct pipe *pi, int writable)
 int
 pipewrite(struct pipe *pi, uint64 addr, int n)
 {
-  int i = 0;
+  int writesize = 0;
+  int pipespace = 0;
   struct proc *pr = myproc();
 
   acquire(&pi->lock);
-  while(i < n){
-    if(pi->readopen == 0 || pr->killed){
-      release(&pi->lock);
-      return -1;
+  if(pi->readopen == 0 || pr->killed){
+    release(&pi->lock);
+    return -1;
+  }
+  pipespace = PIPESIZE - (pi->nwrite - pi->nread);
+  if(pipespace == 0){ //DOC: pipewrite-full
+    wakeup(&pi->nread);
+    sleep(&pi->nwrite, &pi->lock);
+  } else {
+    writesize = n < pipespace ? n : pipespace;
+    int pipewallspace = PIPESIZE - (pi->nwrite % PIPESIZE);
+    if (writesize <= pipewallspace)
+    {
+      if (copyin(pr->pagetable, &pi->data[pi->nwrite % PIPESIZE], addr, writesize) == -1)
+        writesize = 0;
     }
-    if(pi->nwrite == pi->nread + PIPESIZE){ //DOC: pipewrite-full
-      wakeup(&pi->nread);
-      sleep(&pi->nwrite, &pi->lock);
-    } else {
-      char ch;
-      if(copyin(pr->pagetable, &ch, addr + i, 1) == -1)
-        break;
-      pi->data[pi->nwrite++ % PIPESIZE] = ch;
-      i++;
+    else
+    {
+      if (copyin(pr->pagetable, &pi->data[pi->nwrite % PIPESIZE], addr, pipewallspace) == -1)
+      {
+        writesize = 0;
+        goto exit;
+      }
+      if (copyin(pr->pagetable, &pi->data[(pi->nwrite + pipewallspace) % PIPESIZE], addr + pipewallspace, writesize - pipewallspace) == -1)
+        writesize = pipewallspace;
     }
   }
+  pi->nwrite += writesize;
+  exit:
   wakeup(&pi->nread);
   release(&pi->lock);
 
-  return i;
+  return writesize;
 }
 
 int
 piperead(struct pipe *pi, uint64 addr, int n)
 {
-  int i;
+  int readsize = 0;
+  int pipespace = 0;
   struct proc *pr = myproc();
-  char ch;
 
   acquire(&pi->lock);
   while(pi->nread == pi->nwrite && pi->writeopen){  //DOC: pipe-empty
@@ -117,14 +131,30 @@ piperead(struct pipe *pi, uint64 addr, int n)
     }
     sleep(&pi->nread, &pi->lock); //DOC: piperead-sleep
   }
-  for(i = 0; i < n; i++){  //DOC: piperead-copy
-    if(pi->nread == pi->nwrite)
-      break;
-    ch = pi->data[pi->nread++ % PIPESIZE];
-    if(copyout(pr->pagetable, addr + i, &ch, 1) == -1)
-      break;
+  pipespace = pi->nwrite - pi->nread;
+  if (pipespace > 0)
+  {
+    readsize = n < pipespace ? n : pipespace;
+    int pipewallspace = PIPESIZE - (pi->nread % PIPESIZE);
+    if (readsize <= pipewallspace)
+    {
+      if (copyout(pr->pagetable, addr, &pi->data[pi->nread % PIPESIZE], readsize) == -1)
+        readsize = 0;
+    }
+    else
+    {
+      if (copyout(pr->pagetable, addr, &pi->data[pi->nread % PIPESIZE], pipewallspace) == -1)
+      {
+        readsize = 0;
+        goto exit;
+      }
+      if (copyout(pr->pagetable, addr + pipewallspace, &pi->data[(pi->nread + pipewallspace) % PIPESIZE], readsize-pipewallspace) == -1)
+        readsize = pipewallspace;
+    }
   }
+  pi->nread += readsize;
+  exit:
   wakeup(&pi->nwrite);  //DOC: piperead-wakeup
   release(&pi->lock);
-  return i;
+  return readsize;
 }
