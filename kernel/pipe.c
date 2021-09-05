@@ -8,11 +8,13 @@
 #include "sleeplock.h"
 #include "file.h"
 
-#define PIPESIZE 2048
+//keep pipesize small, but have a bigger buffer => single copyin()/copyout() if we keep moving data to start of pipe.
+#define PIPESIZE 1024
+#define BUFFERSIZE 2048
 
 struct pipe {
   struct spinlock lock;
-  char data[PIPESIZE];
+  char data[BUFFERSIZE];
   uint nread;     // number of bytes read
   uint nwrite;    // number of bytes written
   int readopen;   // read fd is still open
@@ -79,38 +81,34 @@ pipewrite(struct pipe *pi, uint64 addr, int n)
   int writesize = 0;
   int pipespace = 0;
   struct proc *pr = myproc();
+  uint* oldnread;
 
   acquire(&pi->lock);
   if(pi->readopen == 0 || pr->killed){
     release(&pi->lock);
     return -1;
   }
+  oldnread = &pi->nread;
   pipespace = PIPESIZE - (pi->nwrite - pi->nread);
   if(pipespace == 0){ //DOC: pipewrite-full
-    wakeup(&pi->nread);
+    wakeup(oldnread);
     sleep(&pi->nwrite, &pi->lock);
   } else {
     writesize = n < pipespace ? n : pipespace;
-    int pipewallspace = PIPESIZE - (pi->nwrite % PIPESIZE);
-    if (writesize <= pipewallspace)
+    int pipewallspace = (pi->nwrite % BUFFERSIZE) == 0 ? 0 : BUFFERSIZE - (pi->nwrite % BUFFERSIZE);
+    // move data to start of pipe if we want to write more than space till end of buffer wall.
+    // Since buffer is 2x size of pipe, we can be sure that there is enough non-overlapping empty space at the start.
+    if(writesize > pipewallspace)
     {
-      if (copyin(pr->pagetable, &pi->data[pi->nwrite % PIPESIZE], addr, writesize) == -1)
-        writesize = 0;
+      memcpy(&pi->data[0], &pi->data[pi->nread % BUFFERSIZE], pi->nwrite - pi->nread);
+      pi->nwrite -= (pi->nread % BUFFERSIZE);
+      pi->nread -= (pi->nread % BUFFERSIZE);
     }
-    else
-    {
-      if (copyin(pr->pagetable, &pi->data[pi->nwrite % PIPESIZE], addr, pipewallspace) == -1)
-      {
-        writesize = 0;
-        goto exit;
-      }
-      if (copyin(pr->pagetable, &pi->data[(pi->nwrite + pipewallspace) % PIPESIZE], addr + pipewallspace, writesize - pipewallspace) == -1)
-        writesize = pipewallspace;
-    }
+    if (copyin(pr->pagetable, &pi->data[pi->nwrite % BUFFERSIZE], addr, writesize) == -1)
+      writesize = 0;
   }
   pi->nwrite += writesize;
-  exit:
-  wakeup(&pi->nread);
+  wakeup(oldnread);
   release(&pi->lock);
 
   return writesize;
@@ -120,7 +118,7 @@ int
 piperead(struct pipe *pi, uint64 addr, int n)
 {
   int readsize = 0;
-  int pipespace = 0;
+  int pipedata = 0;
   struct proc *pr = myproc();
 
   acquire(&pi->lock);
@@ -131,29 +129,14 @@ piperead(struct pipe *pi, uint64 addr, int n)
     }
     sleep(&pi->nread, &pi->lock); //DOC: piperead-sleep
   }
-  pipespace = pi->nwrite - pi->nread;
-  if (pipespace > 0)
+  pipedata = pi->nwrite - pi->nread;
+  if (pipedata > 0)
   {
-    readsize = n < pipespace ? n : pipespace;
-    int pipewallspace = PIPESIZE - (pi->nread % PIPESIZE);
-    if (readsize <= pipewallspace)
-    {
-      if (copyout(pr->pagetable, addr, &pi->data[pi->nread % PIPESIZE], readsize) == -1)
-        readsize = 0;
-    }
-    else
-    {
-      if (copyout(pr->pagetable, addr, &pi->data[pi->nread % PIPESIZE], pipewallspace) == -1)
-      {
-        readsize = 0;
-        goto exit;
-      }
-      if (copyout(pr->pagetable, addr + pipewallspace, &pi->data[(pi->nread + pipewallspace) % PIPESIZE], readsize-pipewallspace) == -1)
-        readsize = pipewallspace;
-    }
+    readsize = n < pipedata ? n : pipedata;
+    if (copyout(pr->pagetable, addr, &pi->data[pi->nread % BUFFERSIZE], readsize) == -1)
+      readsize = 0;
   }
   pi->nread += readsize;
-  exit:
   wakeup(&pi->nwrite);  //DOC: piperead-wakeup
   release(&pi->lock);
   return readsize;
