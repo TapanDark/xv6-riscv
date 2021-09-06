@@ -47,11 +47,44 @@ memmove(void *dst, const void *src, uint n)
   return dst;
 }
 
-// memcpy exists to placate GCC.  Use memmove.
-void*
+void *
 memcpy(void *dst, const void *src, uint n)
 {
-  return memmove(dst, src, n);
+  typedef uint64 __attribute__((__may_alias__)) u64;
+  unsigned char *d = dst;
+  const unsigned char *s = src;
+  // slow copy initial bytes until destination is aligend.
+  for (; (unsigned long)s % 8 && n; n--)
+    *d++ = *s++;
+
+  // Fast copy 32 bytes at a time.
+  for (; n >= 32; s += 32, d += 32, n -= 32)
+  {
+    *(u64 *)(d + 0) = *(u64 *)(s + 0);
+    *(u64 *)(d + 8) = *(u64 *)(s + 8);
+    *(u64 *)(d + 16) = *(u64 *)(s + 16);
+    *(u64 *)(d + 24) = *(u64 *)(s + 24);
+  }
+  if (n >= 16)
+  {
+    *(u64 *)(d + 0) = *(u64 *)(s + 0);
+    *(u64 *)(d + 8) = *(u64 *)(s + 8);
+    s += 16;
+    d += 16;
+    n -= 16;
+  }
+  if (n >= 8)
+  {
+    *(u64 *)(d + 0) = *(u64 *)(s + 0);
+    s += 8;
+    d += 8;
+    n -= 8;
+  }
+
+  // Slow copy remaining bytes.
+  for (; n; n--)
+    *d++ = *s++;
+  return dst;
 }
 
 int
